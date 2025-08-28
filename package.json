@@ -1,0 +1,36 @@
+{
+  "name": "@silyze/async-audio-tts-elevenlabs",
+  "version": "1.0.0",
+  "description": "ElevenLabs implementation for @silyze/async-audio-tts",
+  "main": "dist/lib/index.js",
+  "types": "dist/lib/index.d.ts",
+  "keywords": [],
+  "author": "Mihail Mojsoski",
+  "license": "MIT",
+  "type": "commonjs",
+  "devDependencies": {
+    "@types/node": "^22.18.0",
+    "typescript": "^5.8.3"
+  },
+  "scripts": {
+    "watch": "npx tsc --watch",
+    "build": "npx tsc",
+    "prepare": "npm run build",
+    "version": "git add -A lib",
+    "postversion": "git push && git push --tags",
+    "start": "node dist/example"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@mojsoski/async-websocket-stream": "^1.1.0",
+    "@silyze/async-audio-ffmpeg": "^1.0.0",
+    "@silyze/async-audio-format-alaw": "^1.0.0",
+    "@silyze/async-audio-format-pcm": "^1.0.0",
+    "@silyze/async-audio-format-ulaw": "^1.0.1",
+    "@silyze/async-audio-tts": "^1.0.0",
+    "@types/ws": "^8.18.1",
+    "ws": "^8.18.3"
+  }
+}
