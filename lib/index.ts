@@ -272,24 +272,91 @@ const ElevenLabsWebSocketEncoding: WebsocketStreamEncoding<
   },
 };
 
+const RECONNECT_MIN_DELAY_MS = 200;
+const RECONNECT_MAX_ATTEMPTS = 5;
+
+function wait(ms: number) {
+  return new Promise<void>((resolve) => setTimeout(resolve, ms));
+}
+
+function mergeAbortSignals(
+  ...signals: (AbortSignal | undefined)[]
+): AbortSignal | undefined {
+  const activeSignals = signals.filter(
+    (signal): signal is AbortSignal => Boolean(signal)
+  );
+
+  if (activeSignals.length === 0) {
+    return undefined;
+  }
+
+  const controller = new AbortController();
+  const onAbort = () => {
+    if (!controller.signal.aborted) {
+      controller.abort();
+    }
+  };
+
+  for (const signal of activeSignals) {
+    if (signal.aborted) {
+      onAbort();
+      break;
+    }
+    signal.addEventListener("abort", onAbort, { once: true });
+  }
+
+  return controller.signal;
+}
+
+type ElevenLabsStreamState = {
+  connectionId: number;
+  websocket: WebSocket;
+  stream: AsyncStream<ElevenLabsSubscribeEvent, ElevenLabsPublishEvent>;
+  abortController: AbortController;
+  cleanup: () => void;
+};
+
 export default class ElevenLabsTextToSpeachModel implements TextToSpeachModel {
-  #streamPromise: Promise<
-    AsyncStream<ElevenLabsSubscribeEvent, ElevenLabsPublishEvent>
-  >;
-  #readyPromise: Promise<void>;
+  #region: ElevenLabsRegion;
+  #voiceId: string;
+  #apiKey?: string;
+  #settings?: ElevenLabsWebSocketSettings;
+  #buffer?: AsyncBufferConfig | boolean;
   #format: ElevenLabsOutputFormat;
+  #readyPromise: Promise<void>;
+  #initialInit: Omit<ElevenLabsInitializeConnectionEvent, "text"> | undefined;
   #init: Omit<ElevenLabsInitializeConnectionEvent, "text"> | undefined;
+
+  #streamState?: ElevenLabsStreamState;
+  #connectPromise?: Promise<void>;
+  #reconnectPromise?: Promise<void>;
+  #closePromise?: Promise<void>;
+  #closeRequested = false;
+  #connectionError?: Error;
+  #reconnectAttempts = 0;
+  #connectionCounter = 0;
+  #pendingSockets = new Set<WebSocket>();
+
   private constructor(
-    streamPromise: Promise<
-      AsyncStream<ElevenLabsSubscribeEvent, ElevenLabsPublishEvent>
-    >,
+    config: {
+      region: ElevenLabsRegion;
+      voiceId: string;
+      apiKey?: string;
+      settings?: ElevenLabsWebSocketSettings;
+    },
+    buffer: AsyncBufferConfig | boolean | undefined,
     format: ElevenLabsOutputFormat,
     init: Omit<ElevenLabsInitializeConnectionEvent, "text"> | undefined
   ) {
-    this.#streamPromise = streamPromise;
-    this.#readyPromise = streamPromise.then();
+    this.#region = config.region;
+    this.#voiceId = config.voiceId;
+    this.#apiKey = config.apiKey;
+    this.#settings = config.settings;
+    this.#buffer = buffer;
     this.#format = format;
-    this.#init = init;
+    this.#initialInit = init ? { ...init } : undefined;
+    this.#init = this.#initialInit;
+    this.#readyPromise = this.#startConnect();
   }
 
   static connect(
@@ -302,39 +369,14 @@ export default class ElevenLabsTextToSpeachModel implements TextToSpeachModel {
     }: ElevenLabsTextToSpeachConfig,
     buffer?: AsyncBufferConfig | boolean
   ) {
-    const url = getWebSocketUrl(voice_id, region);
-
-    if (settings) {
-      for (const [name, value] of Object.entries(settings)) {
-        let stringValue: string;
-        switch (typeof value) {
-          case "string":
-            stringValue = value;
-            break;
-          case "boolean":
-            stringValue = value ? "true" : "false";
-            break;
-          default:
-            stringValue = value.toString();
-            break;
-        }
-        url.searchParams.set(name, stringValue);
-      }
-    }
-
-    const ws = new WebSocket(
-      url,
-      apiKey
-        ? {
-            headers: { "xi-api-key": apiKey },
-          }
-        : undefined
-    );
-
-    const promise = getWebsocketStream(ws, ElevenLabsWebSocketEncoding, buffer);
-
     return new ElevenLabsTextToSpeachModel(
-      promise,
+      {
+        region,
+        voiceId: voice_id,
+        apiKey,
+        settings,
+      },
+      buffer,
       settings?.output_format ?? "mp3_44100_128",
       init
     );
@@ -345,20 +387,20 @@ export default class ElevenLabsTextToSpeachModel implements TextToSpeachModel {
   }
 
   async speak(text: string): Promise<void> {
+    const trimmed = text.trim();
+    if (!trimmed.length) {
+      return;
+    }
+
     const previousInit = this.#init;
     if (previousInit) {
       this.#init = undefined;
     }
 
-    if (!text.length) {
-      await ElevenLabsTextToSpeachModel.#packets(
-        this.#streamPromise
-      ).closeConnection({ text: "", ...previousInit });
-      return;
-    }
+    const stream = (await this.#ensureStreamState()).stream;
 
-    await ElevenLabsTextToSpeachModel.#packets(this.#streamPromise).sendText({
-      text,
+    await ElevenLabsTextToSpeachModel.#packets(stream).sendText({
+      text: trimmed,
       ...previousInit,
     });
   }
@@ -369,10 +411,19 @@ export default class ElevenLabsTextToSpeachModel implements TextToSpeachModel {
       this.#init = undefined;
     }
 
-    await ElevenLabsTextToSpeachModel.#packets(this.#streamPromise).sendText({
+    const stream = (await this.#ensureStreamState()).stream;
+
+    await ElevenLabsTextToSpeachModel.#packets(stream).sendText({
       ...event,
       ...previousInit,
     });
+  }
+
+  async close(): Promise<void> {
+    if (!this.#closePromise) {
+      this.#closePromise = this.#performClose();
+    }
+    return this.#closePromise;
   }
 
   static #packets(
@@ -403,21 +454,350 @@ export default class ElevenLabsTextToSpeachModel implements TextToSpeachModel {
   }
 
   async *read(signal?: AbortSignal): AsyncIterable<Buffer<ArrayBufferLike>> {
-    const stream = await this.#streamPromise;
-
-    for await (const output of stream.read(signal)) {
-      if (!("audio" in output)) {
-        throw new ElevenLabsError(output);
-      }
-      if (output.isFinal) {
-        break;
+    while (true) {
+      if (this.#closeRequested) {
+        return;
       }
 
-      yield Buffer.from(output.audio, "base64");
+      const state = await this.#ensureStreamState();
+      const combinedSignal = mergeAbortSignals(
+        signal,
+        state.abortController.signal
+      );
+
+      let sawFinal = false;
+
+      for await (const output of state.stream.read(combinedSignal)) {
+        if (!("audio" in output)) {
+          throw new ElevenLabsError(output);
+        }
+        if (output.isFinal) {
+          sawFinal = true;
+          break;
+        }
+
+        yield Buffer.from(output.audio, "base64");
+      }
+
+      if (sawFinal || this.#closeRequested) {
+        return;
+      }
+
+      if (!state.abortController.signal.aborted) {
+        return;
+      }
+
+      await this.#waitForReconnect(signal);
     }
   }
 
   transform(): AsyncTransform<Buffer<ArrayBufferLike>> {
     return new AsyncTransform(this);
+  }
+
+  async #performClose(): Promise<void> {
+    this.#closeRequested = true;
+
+    if (this.#pendingSockets.size > 0) {
+      for (const socket of this.#pendingSockets) {
+        try {
+          socket.close();
+        } catch {
+          // ignore close errors for pending sockets
+        }
+      }
+      this.#pendingSockets.clear();
+    }
+
+    const pendingAttempts = [
+      this.#connectPromise,
+      this.#reconnectPromise,
+    ].filter((promise): promise is Promise<void> => Boolean(promise));
+
+    if (pendingAttempts.length > 0) {
+      await Promise.allSettled(pendingAttempts);
+    }
+
+    const state = this.#streamState;
+    this.#streamState = undefined;
+
+    if (state) {
+      try {
+        await ElevenLabsTextToSpeachModel.#packets(state.stream).closeConnection(
+          { text: "" }
+        );
+      } catch {
+        // ignore close errors
+      } finally {
+        state.cleanup();
+        if (!state.abortController.signal.aborted) {
+          state.abortController.abort();
+        }
+        try {
+          state.websocket.close();
+        } catch {
+          // ignore close errors
+        }
+      }
+    }
+
+    this.#connectionError = new Error("ElevenLabs stream closed");
+  }
+
+  #startConnect(): Promise<void> {
+    if (!this.#connectPromise) {
+      const pending = this.#connect();
+      const wrapped = pending.finally(() => {
+        if (this.#connectPromise === wrapped) {
+          this.#connectPromise = undefined;
+        }
+      });
+      this.#connectPromise = wrapped;
+    }
+    return this.#connectPromise;
+  }
+
+  async #connect(): Promise<void> {
+    const state = await this.#openStreamState();
+
+    if (this.#closeRequested) {
+      state.cleanup();
+      if (!state.abortController.signal.aborted) {
+        state.abortController.abort();
+      }
+      try {
+        state.websocket.close();
+      } catch {
+        // ignore close errors
+      }
+      return;
+    }
+
+    this.#installState(state);
+  }
+
+  async #openStreamState(): Promise<ElevenLabsStreamState> {
+    const url = this.#buildWebSocketUrl();
+    const websocket = new WebSocket(
+      url,
+      this.#apiKey
+        ? {
+            headers: { "xi-api-key": this.#apiKey },
+          }
+        : undefined
+    );
+
+    this.#pendingSockets.add(websocket);
+
+    try {
+      const stream = await getWebsocketStream(
+        websocket,
+        ElevenLabsWebSocketEncoding,
+        this.#buffer
+      );
+      const abortController = new AbortController();
+      const connectionId = ++this.#connectionCounter;
+
+      const handleCloseOrError = () => {
+        this.#handleSocketClosure(connectionId);
+      };
+
+      websocket.addEventListener("close", handleCloseOrError);
+      websocket.addEventListener("error", handleCloseOrError);
+
+      return {
+        connectionId,
+        websocket,
+        stream,
+        abortController,
+        cleanup: () => {
+          websocket.removeEventListener("close", handleCloseOrError);
+          websocket.removeEventListener("error", handleCloseOrError);
+        },
+      };
+    } catch (error) {
+      try {
+        websocket.close();
+      } catch {
+        // ignore close errors
+      }
+      throw error;
+    } finally {
+      this.#pendingSockets.delete(websocket);
+    }
+  }
+
+  #buildWebSocketUrl(): URL {
+    const url = getWebSocketUrl(this.#voiceId, this.#region);
+    if (this.#settings) {
+      for (const [name, value] of Object.entries(this.#settings)) {
+        if (value === undefined) {
+          continue;
+        }
+        let stringValue: string;
+        switch (typeof value) {
+          case "string":
+            stringValue = value;
+            break;
+          case "boolean":
+            stringValue = value ? "true" : "false";
+            break;
+          default:
+            stringValue = `${value}`;
+            break;
+        }
+        url.searchParams.set(name, stringValue);
+      }
+    }
+    return url;
+  }
+
+  #installState(state: ElevenLabsStreamState) {
+    this.#streamState?.cleanup();
+    this.#streamState = state;
+    this.#reconnectAttempts = 0;
+    this.#connectionError = undefined;
+    this.#init = this.#initialInit;
+  }
+
+  #handleSocketClosure(connectionId: number) {
+    const state = this.#streamState;
+    if (!state || state.connectionId !== connectionId) {
+      return;
+    }
+
+    state.cleanup();
+    if (!state.abortController.signal.aborted) {
+      state.abortController.abort();
+    }
+    this.#streamState = undefined;
+
+    if (this.#closeRequested) {
+      return;
+    }
+
+    this.#scheduleReconnect();
+  }
+
+  #scheduleReconnect() {
+    if (this.#reconnectPromise || this.#closeRequested) {
+      return;
+    }
+
+    const wrapped = this.#attemptReconnect().finally(() => {
+      if (this.#reconnectPromise === wrapped) {
+        this.#reconnectPromise = undefined;
+      }
+    });
+
+    this.#reconnectPromise = wrapped;
+  }
+
+  async #attemptReconnect(): Promise<void> {
+    let lastError: unknown;
+
+    while (
+      !this.#closeRequested &&
+      this.#reconnectAttempts < RECONNECT_MAX_ATTEMPTS
+    ) {
+      if (this.#reconnectAttempts > 0) {
+        await wait(RECONNECT_MIN_DELAY_MS);
+      }
+
+      this.#reconnectAttempts += 1;
+
+      try {
+        await this.#startConnect();
+
+        if (this.#closeRequested) {
+          return;
+        }
+
+        if (this.#streamState) {
+          this.#reconnectAttempts = 0;
+          this.#connectionError = undefined;
+          return;
+        }
+      } catch (error) {
+        lastError = error;
+      }
+    }
+
+    if (!this.#closeRequested && !this.#connectionError) {
+      this.#connectionError =
+        lastError instanceof Error
+          ? lastError
+          : new Error("Failed to reconnect to ElevenLabs stream.");
+    }
+  }
+
+  async #ensureStreamState(): Promise<ElevenLabsStreamState> {
+    if (this.#connectionError) {
+      throw this.#connectionError;
+    }
+
+    if (this.#streamState) {
+      return this.#streamState;
+    }
+
+    if (this.#closeRequested) {
+      throw new Error("ElevenLabs stream is closed");
+    }
+
+    if (!this.#connectPromise && !this.#reconnectPromise) {
+      this.#scheduleReconnect();
+    }
+
+    const pending = this.#reconnectPromise ?? this.#connectPromise;
+
+    if (pending) {
+      try {
+        await pending;
+      } catch (error) {
+        if (error instanceof Error) {
+          this.#connectionError = error;
+        }
+      }
+    }
+
+    if (this.#connectionError) {
+      throw this.#connectionError;
+    }
+
+    if (!this.#streamState) {
+      throw new Error("Unable to establish ElevenLabs stream connection.");
+    }
+
+    return this.#streamState;
+  }
+
+  async #waitForReconnect(signal?: AbortSignal): Promise<void> {
+    while (!this.#closeRequested) {
+      if (signal?.aborted) {
+        return;
+      }
+
+      if (this.#streamState) {
+        return;
+      }
+
+      if (this.#connectionError) {
+        throw this.#connectionError;
+      }
+
+      this.#scheduleReconnect();
+
+      const pending = this.#reconnectPromise ?? this.#connectPromise;
+
+      if (pending) {
+        try {
+          await pending;
+        } catch {
+          // ignore and re-evaluate state
+        }
+      } else {
+        await wait(RECONNECT_MIN_DELAY_MS);
+      }
+    }
   }
 }

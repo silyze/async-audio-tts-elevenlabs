@@ -19,7 +19,6 @@ async function main() {
   await tts.ready;
 
   await tts.speak("Hello, World");
-  await tts.speak("");
 
   const file = await fs.open("example.mp3", "w");
   try {
@@ -28,6 +27,7 @@ async function main() {
     }
   } finally {
     await file.close();
+    await tts.close();
   }
 }
 

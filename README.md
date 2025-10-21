@@ -40,9 +40,6 @@ async function main() {
   // Start synthesis
   await tts.speak("Hello, World");
 
-  // Empty string signals end/flush per ElevenLabs realtime API semantics
-  await tts.speak("");
-
   // Write chunks to a file
   const file = await fs.open("example.mp3", "w");
   try {
@@ -51,6 +48,7 @@ async function main() {
     }
   } finally {
     await file.close();
+    await tts.close();
   }
 }
 
@@ -62,10 +60,11 @@ main();
 - Default export `ElevenLabsTextToSpeachModel` implements `TextToSpeachModel` and adds:
   - `static connect(config: ElevenLabsTextToSpeachConfig)` — opens a realtime WebSocket to ElevenLabs.
   - `ready: Promise<void>` — resolves when the connection is established.
-  - `speak(text: string): Promise<void>` — enqueues text for synthesis. Use `""` to flush/close.
+  - `speak(text: string): Promise<void>` — enqueues text for synthesis. Empty or whitespace-only strings are ignored.
   - `send(event: ElevenLabsPublishEvent): Promise<void>` — send low‑level realtime events directly.
   - `transform(): AsyncTransform<Buffer>` — helper to pipe audio into other async streams.
   - `format: AudioFormat` — describes emitted audio, derived from `settings.output_format`.
+  - `close(): Promise<void>` - gracefully ends the realtime session and stops automatic reconnect attempts.
 
 From `@silyze/async-audio-tts` and `@silyze/async-audio-stream`:
 
@@ -126,6 +125,7 @@ export default class ElevenLabsTextToSpeachModel implements TextToSpeachModel {
   ): ElevenLabsTextToSpeachModel;
   get ready(): Promise<void>;
   speak(text: string): Promise<void>;
+  close(): Promise<void>;
   send(event: unknown): Promise<void>;
   get format(): AudioFormat;
   read(signal?: AbortSignal): AsyncIterable<Buffer>;
@@ -135,8 +135,12 @@ export default class ElevenLabsTextToSpeachModel implements TextToSpeachModel {
 
 ## Notes
 
-- Use `speak("")` to flush and close the realtime session (per ElevenLabs semantics).
+- Call `tts.close()` when you're done to close the realtime session explicitly.
 - Multiple `speak()` calls enqueue additional audio on the same output stream.
 - Start reading immediately to avoid backpressure; audio chunks arrive asynchronously.
 - `tts.format` reflects the `settings.output_format` you selected.
 - Provide your API key via `"xi-api-key"` environment variable.
+- Empty strings passed to `speak` are trimmed and ignored instead of closing the stream.
+- If the ElevenLabs connection closes unexpectedly, the client retries up to five times with at least 200ms between attempts before surfacing an error. Calling `close()` stops those retry attempts.
+
+
