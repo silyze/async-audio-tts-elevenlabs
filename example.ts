@@ -6,7 +6,7 @@ async function main() {
     "xi-api-key": process.env.ELEVEN_LABS_API_KEY,
     settings: {
       model_id: "eleven_multilingual_v2",
-      output_format: "mp3_44100_192",
+      output_format: "mp3_22050_32",
       enable_logging: false,
     },
     init: {
@@ -19,6 +19,7 @@ async function main() {
   await tts.ready;
 
   await tts.speak("Hello, World");
+  await tts.speak("Hello, World 2");
 
   const file = await fs.open("example.mp3", "w");
   try {
@@ -26,8 +27,8 @@ async function main() {
       await file.write(chunk);
     }
   } finally {
-    await file.close();
     await tts.close();
+    await file.close();
   }
 }
 

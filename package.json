@@ -1,6 +1,6 @@
 {
   "name": "@silyze/async-audio-tts-elevenlabs",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "ElevenLabs implementation for @silyze/async-audio-tts",
   "main": "dist/lib/index.js",
   "types": "dist/lib/index.d.ts",

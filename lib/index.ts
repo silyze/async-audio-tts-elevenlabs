@@ -316,6 +316,14 @@ type ElevenLabsStreamState = {
   cleanup: () => void;
 };
 
+type ElevenLabsPacketHandlers = {
+  initializeConnection: (
+    args: ElevenLabsInitializeConnectionEvent
+  ) => Promise<void>;
+  sendText: (args: ElevenLabsSendTextEvent) => Promise<void>;
+  closeConnection: (args: ElevenLabsCloseConnectionEvent) => Promise<void>;
+};
+
 export default class ElevenLabsTextToSpeachModel implements TextToSpeachModel {
   #region: ElevenLabsRegion;
   #voiceId: string;
@@ -392,31 +400,62 @@ export default class ElevenLabsTextToSpeachModel implements TextToSpeachModel {
       return;
     }
 
-    const previousInit = this.#init;
-    if (previousInit) {
-      this.#init = undefined;
-    }
+    const state = await this.#ensureStreamState();
+    const packets = ElevenLabsTextToSpeachModel.#packets(state.stream);
 
-    const stream = (await this.#ensureStreamState()).stream;
+    await this.#sendText(packets, trimmed);
 
-    await ElevenLabsTextToSpeachModel.#packets(stream).sendText({
-      text: trimmed,
-      ...previousInit,
+    await packets.sendText({
+      text: "",
+      flush: true,
+      try_trigger_generation: true,
     });
   }
 
   async send(event: ElevenLabsPublishEvent) {
-    const previousInit = this.#init;
-    if (previousInit) {
+    const state = await this.#ensureStreamState();
+    const packets = ElevenLabsTextToSpeachModel.#packets(state.stream);
+
+    if (
+      "voice_settings" in event ||
+      "generator_config" in event ||
+      "pronunciation_dictionary_locators" in event ||
+      "authorization" in event ||
+      "xi-api-key" in event
+    ) {
       this.#init = undefined;
+      await packets.initializeConnection(
+        event as ElevenLabsInitializeConnectionEvent
+      );
+      return;
     }
 
-    const stream = (await this.#ensureStreamState()).stream;
+    if (
+      !("flush" in event) &&
+      !("try_trigger_generation" in event) &&
+      event.text === ""
+    ) {
+      await packets.closeConnection({ text: "" });
+      return;
+    }
 
-    await ElevenLabsTextToSpeachModel.#packets(stream).sendText({
-      ...event,
-      ...previousInit,
-    });
+    if (event.text.length > 0) {
+      await this.#sendText(packets, event.text);
+    }
+
+    const sendTextEvent = event as ElevenLabsSendTextEvent;
+    const { flush, try_trigger_generation } = sendTextEvent;
+
+    if (
+      flush !== undefined ||
+      try_trigger_generation !== undefined
+    ) {
+      await packets.sendText({
+        text: event.text.length > 0 ? "" : event.text,
+        flush,
+        try_trigger_generation,
+      });
+    }
   }
 
   async close(): Promise<void> {
@@ -449,6 +488,23 @@ export default class ElevenLabsTextToSpeachModel implements TextToSpeachModel {
     };
   }
 
+  async #sendText(
+    packets: ElevenLabsPacketHandlers,
+    text: string
+  ): Promise<void> {
+    const previousInit = this.#init;
+    if (previousInit) {
+      this.#init = undefined;
+      await packets.initializeConnection({
+        text,
+        ...previousInit,
+      });
+      return;
+    }
+
+    await packets.sendText({ text });
+  }
+
   get format(): AudioFormat {
     return fromElevenLabsFormat(this.#format);
   }
@@ -469,6 +525,13 @@ export default class ElevenLabsTextToSpeachModel implements TextToSpeachModel {
 
       for await (const output of state.stream.read(combinedSignal)) {
         if (!("audio" in output)) {
+          if ("error" in output) {
+            if (output.error === "input_timeout_exceeded") {
+              sawFinal = true;
+              break;
+            }
+            throw new ElevenLabsError(output);
+          }
           throw new ElevenLabsError(output);
         }
         if (output.isFinal) {
