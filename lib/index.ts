@@ -5,6 +5,7 @@ import {
 } from "@mojsoski/async-stream";
 import { AudioFormat } from "@silyze/async-audio-stream";
 import WebSocket from "ws";
+import type { CloseEvent, ErrorEvent } from "ws";
 import TextToSpeachModel from "@silyze/async-audio-tts";
 import {
   getWebsocketStream,
@@ -396,15 +397,23 @@ export default class ElevenLabsTextToSpeachModel implements TextToSpeachModel {
     buffer?: AsyncBufferConfig | boolean,
     log?: ILogOptions
   ) {
+    const normalizedSettings: ElevenLabsWebSocketSettings = {
+      enable_logging: true,
+      ...(settings ?? {}),
+    };
+
+    const outputFormat =
+      normalizedSettings.output_format ?? "mp3_44100_128";
+
     return new ElevenLabsTextToSpeachModel(
       {
         region,
         voiceId: voice_id,
         apiKey,
-        settings,
+        settings: normalizedSettings,
       },
       buffer,
-      settings?.output_format ?? "mp3_44100_128",
+      outputFormat,
       init,
       log
     );
@@ -803,12 +812,33 @@ export default class ElevenLabsTextToSpeachModel implements TextToSpeachModel {
         connectionId,
       });
 
-      const handleCloseOrError = () => {
-        this.#handleSocketClosure(connectionId);
+      const handleClose = (event: CloseEvent) => {
+        this.#handleSocketClosure(connectionId, {
+          eventType: "close",
+          code: event.code,
+          reason: event.reason,
+          wasClean: event.wasClean,
+        });
       };
 
-      websocket.addEventListener("close", handleCloseOrError);
-      websocket.addEventListener("error", handleCloseOrError);
+      const handleError = (event: ErrorEvent) => {
+        const details: Record<string, unknown> = {
+          eventType: "error",
+        };
+        if (event.message) {
+          details.message = event.message;
+        }
+        if (event.error !== undefined) {
+          details.error =
+            event.error instanceof Error
+              ? event.error.message
+              : String(event.error);
+        }
+        this.#handleSocketClosure(connectionId, details);
+      };
+
+      websocket.addEventListener("close", handleClose);
+      websocket.addEventListener("error", handleError);
 
       return {
         connectionId,
@@ -816,8 +846,8 @@ export default class ElevenLabsTextToSpeachModel implements TextToSpeachModel {
         stream,
         abortController,
         cleanup: () => {
-          websocket.removeEventListener("close", handleCloseOrError);
-          websocket.removeEventListener("error", handleCloseOrError);
+          websocket.removeEventListener("close", handleClose);
+          websocket.removeEventListener("error", handleError);
         },
       };
     } catch (error) {
@@ -880,25 +910,39 @@ export default class ElevenLabsTextToSpeachModel implements TextToSpeachModel {
     });
   }
 
-  #handleSocketClosure(connectionId: number) {
+  #handleSocketClosure(
+    connectionId: number,
+    details?: Record<string, unknown>
+  ) {
+    const withDetails = (base: Record<string, unknown>) =>
+      details ? { ...base, ...details } : base;
+
     const state = this.#streamState;
     if (!state) {
-      this.#log("connection", "Socket closure ignored, no active state", {
-        connectionId,
-      });
+      this.#log(
+        "connection",
+        "Socket closure ignored, no active state",
+        withDetails({ connectionId })
+      );
       return;
     }
     if (state.connectionId !== connectionId) {
-      this.#log("connection", "Socket closure ignored, stale connection", {
-        connectionId,
-        activeConnectionId: state.connectionId,
-      });
+      this.#log(
+        "connection",
+        "Socket closure ignored, stale connection",
+        withDetails({
+          connectionId,
+          activeConnectionId: state.connectionId,
+        })
+      );
       return;
     }
 
-    this.#log("connection", "Socket closure detected", {
-      connectionId,
-    });
+    this.#log(
+      "connection",
+      "Socket closure detected",
+      withDetails({ connectionId })
+    );
     state.cleanup();
     if (!state.abortController.signal.aborted) {
       state.abortController.abort();
@@ -906,15 +950,19 @@ export default class ElevenLabsTextToSpeachModel implements TextToSpeachModel {
     this.#streamState = undefined;
 
     if (this.#closeRequested) {
-      this.#log("connection", "Socket closure during close request", {
-        connectionId,
-      });
+      this.#log(
+        "connection",
+        "Socket closure during close request",
+        withDetails({ connectionId })
+      );
       return;
     }
 
-    this.#log("connection", "Scheduling reconnect after socket closure", {
-      connectionId,
-    });
+    this.#log(
+      "connection",
+      "Scheduling reconnect after socket closure",
+      withDetails({ connectionId })
+    );
     this.#scheduleReconnect();
   }
 
