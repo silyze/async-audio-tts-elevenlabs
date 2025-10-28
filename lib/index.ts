@@ -212,6 +212,10 @@ export type ElevenLabsPublishEvent =
   | ElevenLabsSendTextEvent
   | ElevenLabsInitializeConnectionEvent;
 
+export interface ILogOptions {
+  log(area: string, message: string, extra?: object): void;
+}
+
 export type ElevenLabsAlignment = {
   charStartTimesMs?: number[];
   charsDurationsMs?: number[];
@@ -279,6 +283,12 @@ function wait(ms: number) {
   return new Promise<void>((resolve) => setTimeout(resolve, ms));
 }
 
+const NoopLogger: ILogOptions = {
+  log() {
+    // intentionally empty
+  },
+};
+
 function mergeAbortSignals(
   ...signals: (AbortSignal | undefined)[]
 ): AbortSignal | undefined {
@@ -334,6 +344,7 @@ export default class ElevenLabsTextToSpeachModel implements TextToSpeachModel {
   #readyPromise: Promise<void>;
   #initialInit: Omit<ElevenLabsInitializeConnectionEvent, "text"> | undefined;
   #init: Omit<ElevenLabsInitializeConnectionEvent, "text"> | undefined;
+  #logger: ILogOptions;
 
   #streamState?: ElevenLabsStreamState;
   #connectPromise?: Promise<void>;
@@ -354,8 +365,10 @@ export default class ElevenLabsTextToSpeachModel implements TextToSpeachModel {
     },
     buffer: AsyncBufferConfig | boolean | undefined,
     format: ElevenLabsOutputFormat,
-    init: Omit<ElevenLabsInitializeConnectionEvent, "text"> | undefined
+    init: Omit<ElevenLabsInitializeConnectionEvent, "text"> | undefined,
+    log: ILogOptions | undefined
   ) {
+    this.#logger = log ?? NoopLogger;
     this.#region = config.region;
     this.#voiceId = config.voiceId;
     this.#apiKey = config.apiKey;
@@ -364,6 +377,11 @@ export default class ElevenLabsTextToSpeachModel implements TextToSpeachModel {
     this.#format = format;
     this.#initialInit = init ? { ...init } : undefined;
     this.#init = this.#initialInit;
+    this.#log("lifecycle", "Model instance created", {
+      region: this.#region,
+      voiceId: this.#voiceId,
+      hasInitialInit: Boolean(this.#initialInit),
+    });
     this.#readyPromise = this.#startConnect();
   }
 
@@ -375,7 +393,8 @@ export default class ElevenLabsTextToSpeachModel implements TextToSpeachModel {
       settings,
       init,
     }: ElevenLabsTextToSpeachConfig,
-    buffer?: AsyncBufferConfig | boolean
+    buffer?: AsyncBufferConfig | boolean,
+    log?: ILogOptions
   ) {
     return new ElevenLabsTextToSpeachModel(
       {
@@ -386,7 +405,8 @@ export default class ElevenLabsTextToSpeachModel implements TextToSpeachModel {
       },
       buffer,
       settings?.output_format ?? "mp3_44100_128",
-      init
+      init,
+      log
     );
   }
 
@@ -395,25 +415,45 @@ export default class ElevenLabsTextToSpeachModel implements TextToSpeachModel {
   }
 
   async speak(text: string): Promise<void> {
+    this.#log("speak", "Speak invoked", { textLength: text.length, text });
     const trimmed = text.trim();
     if (!trimmed.length) {
+      this.#log("speak", "Speak skipped due to empty text after trim");
       return;
     }
 
     const state = await this.#ensureStreamState();
+    this.#log("speak", "Stream state ready for speak", {
+      connectionId: state.connectionId,
+    });
     const packets = ElevenLabsTextToSpeachModel.#packets(state.stream);
 
+    this.#log("speak", "Sending speech text", {
+      textLength: trimmed.length,
+    });
     await this.#sendText(packets, trimmed);
 
+    this.#log("speak", "Requesting flush for speech generation");
     await packets.sendText({
       text: "",
       flush: true,
       try_trigger_generation: true,
     });
+    this.#log("speak", "Speak completed");
   }
 
   async send(event: ElevenLabsPublishEvent) {
+    this.#log("send", "Send invoked", {
+      eventKeys: Object.keys(event),
+      text:
+        "text" in event
+          ? event.text
+          : undefined,
+    });
     const state = await this.#ensureStreamState();
+    this.#log("send", "Stream state ready for send", {
+      connectionId: state.connectionId,
+    });
     const packets = ElevenLabsTextToSpeachModel.#packets(state.stream);
 
     if (
@@ -427,6 +467,14 @@ export default class ElevenLabsTextToSpeachModel implements TextToSpeachModel {
       await packets.initializeConnection(
         event as ElevenLabsInitializeConnectionEvent
       );
+      this.#log("send", "Sent initializeConnection packet", {
+        hasVoiceSettings: Boolean(
+          (event as ElevenLabsInitializeConnectionEvent).voice_settings
+        ),
+        hasGeneratorConfig: Boolean(
+          (event as ElevenLabsInitializeConnectionEvent).generator_config
+        ),
+      });
       return;
     }
 
@@ -436,10 +484,14 @@ export default class ElevenLabsTextToSpeachModel implements TextToSpeachModel {
       event.text === ""
     ) {
       await packets.closeConnection({ text: "" });
+      this.#log("send", "Sent closeConnection packet");
       return;
     }
 
     if (event.text.length > 0) {
+      this.#log("send", "Sending text payload", {
+        textLength: event.text.length,
+      });
       await this.#sendText(packets, event.text);
     }
 
@@ -450,17 +502,26 @@ export default class ElevenLabsTextToSpeachModel implements TextToSpeachModel {
       flush !== undefined ||
       try_trigger_generation !== undefined
     ) {
+      this.#log("send", "Sending flush/trigger packet", {
+        flush: flush ?? false,
+        tryTriggerGeneration: try_trigger_generation ?? false,
+      });
       await packets.sendText({
         text: event.text.length > 0 ? "" : event.text,
         flush,
         try_trigger_generation,
       });
     }
+    this.#log("send", "Send invocation complete");
   }
 
   async close(): Promise<void> {
+    this.#log("close", "Close requested");
     if (!this.#closePromise) {
+      this.#log("close", "Initiating close sequence");
       this.#closePromise = this.#performClose();
+    } else {
+      this.#log("close", "Close already in progress");
     }
     return this.#closePromise;
   }
@@ -493,16 +554,23 @@ export default class ElevenLabsTextToSpeachModel implements TextToSpeachModel {
     text: string
   ): Promise<void> {
     const previousInit = this.#init;
+    this.#log("send", "Preparing to send text", {
+      textLength: text.length,
+      hasPendingInit: Boolean(previousInit),
+    });
     if (previousInit) {
       this.#init = undefined;
+      this.#log("send", "Sending initializeConnection with text payload");
       await packets.initializeConnection({
         text,
         ...previousInit,
       });
+      this.#log("send", "initializeConnection with text payload sent");
       return;
     }
 
     await packets.sendText({ text });
+    this.#log("send", "Text packet sent");
   }
 
   get format(): AudioFormat {
@@ -510,12 +578,17 @@ export default class ElevenLabsTextToSpeachModel implements TextToSpeachModel {
   }
 
   async *read(signal?: AbortSignal): AsyncIterable<Buffer<ArrayBufferLike>> {
+    this.#log("read", "Read iterator started");
     while (true) {
       if (this.#closeRequested) {
+        this.#log("read", "Read exiting due to close request");
         return;
       }
 
       const state = await this.#ensureStreamState();
+      this.#log("read", "Stream state ready for read", {
+        connectionId: state.connectionId,
+      });
       const combinedSignal = mergeAbortSignals(
         signal,
         state.abortController.signal
@@ -528,44 +601,68 @@ export default class ElevenLabsTextToSpeachModel implements TextToSpeachModel {
           if ("error" in output) {
             if (output.error === "input_timeout_exceeded") {
               sawFinal = true;
+              this.#log("read", "Input timeout exceeded, treating as final");
               break;
             }
+            this.#log("read", "Error event received from stream", {
+              error: output.error,
+              message: output.message,
+            });
             throw new ElevenLabsError(output);
           }
+          this.#log("read", "Unexpected event received from stream", {
+            keys: Object.keys(output),
+          });
           throw new ElevenLabsError(output);
         }
         if (output.isFinal) {
           sawFinal = true;
+          this.#log("read", "Final audio event received");
           break;
         }
 
-        yield Buffer.from(output.audio, "base64");
+        const chunk = Buffer.from(output.audio, "base64");
+        this.#log("read", "Audio chunk decoded", {
+          chunkSize: chunk.length,
+        });
+        yield chunk;
       }
 
       if (sawFinal || this.#closeRequested) {
+        this.#log("read", "Read loop terminating after final event or close");
         return;
       }
 
       if (!state.abortController.signal.aborted) {
+        this.#log("read", "Read loop exiting without abort signal");
         return;
       }
 
+      this.#log("read", "Awaiting reconnect after aborted stream");
       await this.#waitForReconnect(signal);
     }
   }
 
   transform(): AsyncTransform<Buffer<ArrayBufferLike>> {
+    this.#log("transform", "Creating AsyncTransform wrapper");
     return new AsyncTransform(this);
   }
 
   async #performClose(): Promise<void> {
+    this.#log("close", "Close sequence started");
     this.#closeRequested = true;
 
     if (this.#pendingSockets.size > 0) {
+      this.#log("close", "Closing pending sockets", {
+        pending: this.#pendingSockets.size,
+      });
       for (const socket of this.#pendingSockets) {
         try {
           socket.close();
-        } catch {
+        } catch (error) {
+          this.#log("close", "Error while closing pending socket", {
+            error: error instanceof Error ? error.message : String(error),
+          });
           // ignore close errors for pending sockets
         }
       }
@@ -578,6 +675,9 @@ export default class ElevenLabsTextToSpeachModel implements TextToSpeachModel {
     ].filter((promise): promise is Promise<void> => Boolean(promise));
 
     if (pendingAttempts.length > 0) {
+      this.#log("close", "Awaiting pending connection attempts", {
+        pendingAttempts: pendingAttempts.length,
+      });
       await Promise.allSettled(pendingAttempts);
     }
 
@@ -585,11 +685,21 @@ export default class ElevenLabsTextToSpeachModel implements TextToSpeachModel {
     this.#streamState = undefined;
 
     if (state) {
+      this.#log("close", "Sending close packet to stream", {
+        connectionId: state.connectionId,
+      });
       try {
         await ElevenLabsTextToSpeachModel.#packets(state.stream).closeConnection(
           { text: "" }
         );
-      } catch {
+        this.#log("close", "Close packet sent", {
+          connectionId: state.connectionId,
+        });
+      } catch (error) {
+        this.#log("close", "Error while sending close packet", {
+          connectionId: state.connectionId,
+          error: error instanceof Error ? error.message : String(error),
+        });
         // ignore close errors
       } finally {
         state.cleanup();
@@ -598,17 +708,31 @@ export default class ElevenLabsTextToSpeachModel implements TextToSpeachModel {
         }
         try {
           state.websocket.close();
-        } catch {
+        } catch (error) {
+          this.#log("close", "Error while closing websocket", {
+            connectionId: state.connectionId,
+            error: error instanceof Error ? error.message : String(error),
+          });
           // ignore close errors
         }
       }
     }
 
     this.#connectionError = new Error("ElevenLabs stream closed");
+    this.#log("close", "Close sequence complete");
+  }
+
+  #log(area: string, message: string, extra?: object) {
+    try {
+      this.#logger.log(area, message, extra);
+    } catch {
+      // ignore logging errors
+    }
   }
 
   #startConnect(): Promise<void> {
     if (!this.#connectPromise) {
+      this.#log("connection", "Starting initial connect");
       const pending = this.#connect();
       const wrapped = pending.finally(() => {
         if (this.#connectPromise === wrapped) {
@@ -616,14 +740,23 @@ export default class ElevenLabsTextToSpeachModel implements TextToSpeachModel {
         }
       });
       this.#connectPromise = wrapped;
+    } else {
+      this.#log("connection", "Connect requested while pending");
     }
     return this.#connectPromise;
   }
 
   async #connect(): Promise<void> {
+    this.#log("connection", "Connect routine invoked");
     const state = await this.#openStreamState();
+    this.#log("connection", "Stream state opened", {
+      connectionId: state.connectionId,
+    });
 
     if (this.#closeRequested) {
+      this.#log("connection", "Close requested during connect", {
+        connectionId: state.connectionId,
+      });
       state.cleanup();
       if (!state.abortController.signal.aborted) {
         state.abortController.abort();
@@ -636,11 +769,17 @@ export default class ElevenLabsTextToSpeachModel implements TextToSpeachModel {
       return;
     }
 
+    this.#log("connection", "Installing stream state", {
+      connectionId: state.connectionId,
+    });
     this.#installState(state);
   }
 
   async #openStreamState(): Promise<ElevenLabsStreamState> {
     const url = this.#buildWebSocketUrl();
+    this.#log("connection", "Opening WebSocket connection", {
+      url: url.toString(),
+    });
     const websocket = new WebSocket(
       url,
       this.#apiKey
@@ -660,6 +799,9 @@ export default class ElevenLabsTextToSpeachModel implements TextToSpeachModel {
       );
       const abortController = new AbortController();
       const connectionId = ++this.#connectionCounter;
+      this.#log("connection", "WebSocket stream established", {
+        connectionId,
+      });
 
       const handleCloseOrError = () => {
         this.#handleSocketClosure(connectionId);
@@ -679,6 +821,9 @@ export default class ElevenLabsTextToSpeachModel implements TextToSpeachModel {
         },
       };
     } catch (error) {
+      this.#log("connection", "WebSocket stream failed to open", {
+        error: error instanceof Error ? error.message : String(error),
+      });
       try {
         websocket.close();
       } catch {
@@ -712,23 +857,48 @@ export default class ElevenLabsTextToSpeachModel implements TextToSpeachModel {
         url.searchParams.set(name, stringValue);
       }
     }
+    this.#log("connection", "Built WebSocket URL", {
+      url: url.toString(),
+      hasSettings: Boolean(this.#settings),
+    });
     return url;
   }
 
   #installState(state: ElevenLabsStreamState) {
+    const replacing = Boolean(this.#streamState);
+    this.#log("connection", "Installing new stream state", {
+      connectionId: state.connectionId,
+      replacing,
+    });
     this.#streamState?.cleanup();
     this.#streamState = state;
     this.#reconnectAttempts = 0;
     this.#connectionError = undefined;
     this.#init = this.#initialInit;
+    this.#log("connection", "Stream state installation complete", {
+      connectionId: state.connectionId,
+    });
   }
 
   #handleSocketClosure(connectionId: number) {
     const state = this.#streamState;
-    if (!state || state.connectionId !== connectionId) {
+    if (!state) {
+      this.#log("connection", "Socket closure ignored, no active state", {
+        connectionId,
+      });
+      return;
+    }
+    if (state.connectionId !== connectionId) {
+      this.#log("connection", "Socket closure ignored, stale connection", {
+        connectionId,
+        activeConnectionId: state.connectionId,
+      });
       return;
     }
 
+    this.#log("connection", "Socket closure detected", {
+      connectionId,
+    });
     state.cleanup();
     if (!state.abortController.signal.aborted) {
       state.abortController.abort();
@@ -736,20 +906,35 @@ export default class ElevenLabsTextToSpeachModel implements TextToSpeachModel {
     this.#streamState = undefined;
 
     if (this.#closeRequested) {
+      this.#log("connection", "Socket closure during close request", {
+        connectionId,
+      });
       return;
     }
 
+    this.#log("connection", "Scheduling reconnect after socket closure", {
+      connectionId,
+    });
     this.#scheduleReconnect();
   }
 
   #scheduleReconnect() {
-    if (this.#reconnectPromise || this.#closeRequested) {
+    if (this.#reconnectPromise) {
+      this.#log("reconnect", "Reconnect already scheduled");
+      return;
+    }
+    if (this.#closeRequested) {
+      this.#log("reconnect", "Reconnect skipped due to closing");
       return;
     }
 
+    this.#log("reconnect", "Scheduling reconnect attempt", {
+      attempt: this.#reconnectAttempts + 1,
+    });
     const wrapped = this.#attemptReconnect().finally(() => {
       if (this.#reconnectPromise === wrapped) {
         this.#reconnectPromise = undefined;
+        this.#log("reconnect", "Reconnect promise cleared");
       }
     });
 
@@ -758,30 +943,49 @@ export default class ElevenLabsTextToSpeachModel implements TextToSpeachModel {
 
   async #attemptReconnect(): Promise<void> {
     let lastError: unknown;
+    this.#log("reconnect", "Reconnect routine started", {
+      attemptsSoFar: this.#reconnectAttempts,
+    });
 
     while (
       !this.#closeRequested &&
       this.#reconnectAttempts < RECONNECT_MAX_ATTEMPTS
     ) {
       if (this.#reconnectAttempts > 0) {
+        this.#log("reconnect", "Waiting before next reconnect attempt", {
+          delayMs: RECONNECT_MIN_DELAY_MS,
+          attempt: this.#reconnectAttempts + 1,
+        });
         await wait(RECONNECT_MIN_DELAY_MS);
       }
 
       this.#reconnectAttempts += 1;
+      this.#log("reconnect", "Attempting reconnect", {
+        attempt: this.#reconnectAttempts,
+        maxAttempts: RECONNECT_MAX_ATTEMPTS,
+      });
 
       try {
         await this.#startConnect();
 
         if (this.#closeRequested) {
+          this.#log("reconnect", "Reconnect aborted due to close request");
           return;
         }
 
         if (this.#streamState) {
+          this.#log("reconnect", "Reconnect successful", {
+            attempt: this.#reconnectAttempts,
+          });
           this.#reconnectAttempts = 0;
           this.#connectionError = undefined;
           return;
         }
       } catch (error) {
+        this.#log("reconnect", "Reconnect attempt failed", {
+          attempt: this.#reconnectAttempts,
+          error: error instanceof Error ? error.message : String(error),
+        });
         lastError = error;
       }
     }
@@ -791,23 +995,39 @@ export default class ElevenLabsTextToSpeachModel implements TextToSpeachModel {
         lastError instanceof Error
           ? lastError
           : new Error("Failed to reconnect to ElevenLabs stream.");
+      this.#log("reconnect", "Reconnect attempts exhausted", {
+        attempts: this.#reconnectAttempts,
+        error:
+          this.#connectionError instanceof Error
+            ? this.#connectionError.message
+            : String(this.#connectionError),
+      });
     }
   }
 
   async #ensureStreamState(): Promise<ElevenLabsStreamState> {
     if (this.#connectionError) {
+      this.#log("connection", "ensureStreamState throwing stored error", {
+        error: this.#connectionError.message,
+      });
       throw this.#connectionError;
     }
 
-    if (this.#streamState) {
-      return this.#streamState;
+    const cachedStreamState = this.#streamState;
+    if (cachedStreamState !== undefined) {
+      this.#log("connection", "ensureStreamState returning cached state", {
+        connectionId: cachedStreamState.connectionId,
+      });
+      return cachedStreamState;
     }
 
     if (this.#closeRequested) {
+      this.#log("connection", "ensureStreamState called during close");
       throw new Error("ElevenLabs stream is closed");
     }
 
     if (!this.#connectPromise && !this.#reconnectPromise) {
+      this.#log("connection", "No connection pending, scheduling reconnect");
       this.#scheduleReconnect();
     }
 
@@ -815,8 +1035,12 @@ export default class ElevenLabsTextToSpeachModel implements TextToSpeachModel {
 
     if (pending) {
       try {
+        this.#log("connection", "Awaiting pending connection");
         await pending;
       } catch (error) {
+        this.#log("connection", "Pending connection rejected", {
+          error: error instanceof Error ? error.message : String(error),
+        });
         if (error instanceof Error) {
           this.#connectionError = error;
         }
@@ -824,27 +1048,44 @@ export default class ElevenLabsTextToSpeachModel implements TextToSpeachModel {
     }
 
     if (this.#connectionError) {
+      this.#log("connection", "Throwing connection error after awaiting", {
+        error: this.#connectionError.message,
+      });
       throw this.#connectionError;
     }
 
     if (!this.#streamState) {
+      this.#log("connection", "No stream state after pending connection");
       throw new Error("Unable to establish ElevenLabs stream connection.");
     }
 
-    return this.#streamState;
+    const streamState = this.#streamState;
+    this.#log("connection", "ensureStreamState resolved stream state", {
+      connectionId: streamState.connectionId,
+    });
+    return streamState;
   }
 
   async #waitForReconnect(signal?: AbortSignal): Promise<void> {
+    this.#log("reconnect", "Waiting for reconnect to complete");
     while (!this.#closeRequested) {
       if (signal?.aborted) {
+        this.#log("reconnect", "Reconnect wait aborted by signal");
         return;
       }
 
-      if (this.#streamState) {
+      const streamState = this.#streamState;
+      if (streamState !== undefined) {
+        this.#log("reconnect", "Stream state restored during wait", {
+          connectionId: streamState.connectionId,
+        });
         return;
       }
 
       if (this.#connectionError) {
+        this.#log("reconnect", "Reconnect wait throwing connection error", {
+          error: this.#connectionError.message,
+        });
         throw this.#connectionError;
       }
 
@@ -854,11 +1095,16 @@ export default class ElevenLabsTextToSpeachModel implements TextToSpeachModel {
 
       if (pending) {
         try {
+          this.#log("reconnect", "Awaiting reconnect promise during wait");
           await pending;
         } catch {
           // ignore and re-evaluate state
+          this.#log("reconnect", "Reconnect wait caught rejected promise");
         }
       } else {
+        this.#log("reconnect", "No reconnect promise, sleeping", {
+          delayMs: RECONNECT_MIN_DELAY_MS,
+        });
         await wait(RECONNECT_MIN_DELAY_MS);
       }
     }
