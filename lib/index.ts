@@ -290,11 +290,21 @@ const NoopLogger: ILogOptions = {
   },
 };
 
+function maskSecret(secret: string): string {
+  const trimmed = secret.trim();
+  if (trimmed.length <= 6) {
+    return "*".repeat(Math.max(trimmed.length, 3));
+  }
+  const start = trimmed.slice(0, 3);
+  const end = trimmed.slice(-3);
+  return `${start}***${end}`;
+}
+
 function mergeAbortSignals(
   ...signals: (AbortSignal | undefined)[]
 ): AbortSignal | undefined {
-  const activeSignals = signals.filter(
-    (signal): signal is AbortSignal => Boolean(signal)
+  const activeSignals = signals.filter((signal): signal is AbortSignal =>
+    Boolean(signal)
   );
 
   if (activeSignals.length === 0) {
@@ -381,7 +391,8 @@ export default class ElevenLabsTextToSpeachModel implements TextToSpeachModel {
     this.#log("lifecycle", "Model instance created", {
       region: this.#region,
       voiceId: this.#voiceId,
-      apiKey: this.#apiKey,
+      hasApiKey: Boolean(this.#apiKey),
+      apiKeyMasked: this.#apiKey ? maskSecret(this.#apiKey) : undefined,
       hasInitialInit: Boolean(this.#initialInit),
     });
     this.#readyPromise = this.#startConnect();
@@ -403,8 +414,7 @@ export default class ElevenLabsTextToSpeachModel implements TextToSpeachModel {
       ...(settings ?? {}),
     };
 
-    const outputFormat =
-      normalizedSettings.output_format ?? "mp3_44100_128";
+    const outputFormat = normalizedSettings.output_format ?? "mp3_44100_128";
 
     return new ElevenLabsTextToSpeachModel(
       {
@@ -455,10 +465,7 @@ export default class ElevenLabsTextToSpeachModel implements TextToSpeachModel {
   async send(event: ElevenLabsPublishEvent) {
     this.#log("send", "Send invoked", {
       eventKeys: Object.keys(event),
-      text:
-        "text" in event
-          ? event.text
-          : undefined,
+      text: "text" in event ? event.text : undefined,
     });
     const state = await this.#ensureStreamState();
     this.#log("send", "Stream state ready for send", {
@@ -508,10 +515,7 @@ export default class ElevenLabsTextToSpeachModel implements TextToSpeachModel {
     const sendTextEvent = event as ElevenLabsSendTextEvent;
     const { flush, try_trigger_generation } = sendTextEvent;
 
-    if (
-      flush !== undefined ||
-      try_trigger_generation !== undefined
-    ) {
+    if (flush !== undefined || try_trigger_generation !== undefined) {
       this.#log("send", "Sending flush/trigger packet", {
         flush: flush ?? false,
         tryTriggerGeneration: try_trigger_generation ?? false,
@@ -699,9 +703,9 @@ export default class ElevenLabsTextToSpeachModel implements TextToSpeachModel {
         connectionId: state.connectionId,
       });
       try {
-        await ElevenLabsTextToSpeachModel.#packets(state.stream).closeConnection(
-          { text: "" }
-        );
+        await ElevenLabsTextToSpeachModel.#packets(
+          state.stream
+        ).closeConnection({ text: "" });
         this.#log("close", "Close packet sent", {
           connectionId: state.connectionId,
         });
@@ -888,9 +892,17 @@ export default class ElevenLabsTextToSpeachModel implements TextToSpeachModel {
         url.searchParams.set(name, stringValue);
       }
     }
+    if (this.#apiKey) {
+      url.searchParams.set("xi-api-key", this.#apiKey);
+    }
+    const loggedUrl = new URL(url.toString());
+    if (this.#apiKey) {
+      loggedUrl.searchParams.set("xi-api-key", maskSecret(this.#apiKey));
+    }
     this.#log("connection", "Built WebSocket URL", {
-      url: url.toString(),
+      url: loggedUrl.toString(),
       hasSettings: Boolean(this.#settings),
+      hasApiKey: Boolean(this.#apiKey),
     });
     return url;
   }
