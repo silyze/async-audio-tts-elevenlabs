@@ -381,6 +381,7 @@ export default class ElevenLabsTextToSpeachModel implements TextToSpeachModel {
     this.#log("lifecycle", "Model instance created", {
       region: this.#region,
       voiceId: this.#voiceId,
+      apiKey: this.#apiKey,
       hasInitialInit: Boolean(this.#initialInit),
     });
     this.#readyPromise = this.#startConnect();
